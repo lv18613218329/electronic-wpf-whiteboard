@@ -477,12 +477,16 @@
                         
                         <!-- 更多 面板 -->
                         <StackPanel x:Name="morePanel" Visibility="Collapsed" Margin="15,10">
-                            <StackPanel Orientation="Horizontal">
+                            <StackPanel Orientation="Horizontal" Margin="0,0,0,10">
                                 <Button Style="{StaticResource SecondaryButtonStyle}" Content="清空画布" Click="OnClearCanvas"/>
                                 <Button Style="{StaticResource SecondaryButtonStyle}" Content="全屏模式" Click="OnFullScreen"/>
                                 <Button Style="{StaticResource SecondaryButtonStyle}" Content="导出" Click="OnExport"/>
                                 <Button Style="{StaticResource SecondaryButtonStyle}" Content="导入" Click="OnImport"/>
                             </StackPanel>
+                            <CheckBox x:Name="chkSnap" Content="开启图形吸附" Foreground="White" 
+                                      IsChecked="True" FontSize="13" Margin="0,0,0,5" Checked="OnSnapChanged" Unchecked="OnSnapChanged"/>
+                            <CheckBox x:Name="chkGuideLine" Content="开启对齐辅助线" Foreground="White" 
+                                      IsChecked="True" FontSize="13" Checked="OnGuideLineChanged" Unchecked="OnGuideLineChanged"/>
                         </StackPanel>
                         
                         <!-- 选择/文本/智能笔 面板（提示信息） -->

@@ -120,7 +120,25 @@ namespace ElectronicWhiteboard
         // 辅助线相关字段
         private Line? _horizontalGuideLine; // 水平对齐辅助线
         private Line? _verticalGuideLine; // 垂直对齐辅助线
-        private const double GUIDE_SNAP_DISTANCE = 10; // 辅助线吸附距离
+        private const double GUIDE_SNAP_DISTANCE = 10; // 辅助线显示距离
+        private const double SNAP_THRESHOLD = 5; // 吸附阈值
+        
+        // 吸附位置记录（用于释放时应用）
+        private double? _snapLeft; // 吸附到的X位置
+        private double? _snapTop; // 吸附到的Y位置
+        
+        // 图形设置
+        private bool _snapEnabled = true; // 吸附开关
+        private bool _guideLineEnabled = true; // 辅助线开关
+        
+        // 连接点相关字段
+        private readonly List<Ellipse> _connectorPoints = new(); // 当前显示的连接点（小圆点）
+        private readonly List<Models.ConnectionModel> _connections = new(); // 连接线列表
+        private readonly List<Line> _connectionLines = new(); // 连接线图形
+        private Ellipse? _highlightConnector; // 高亮显示的可连接点
+        private bool _isDraggingToConnect = false; // 是否正在拖动创建连接
+        private UIElement? _connectionSourceShape; // 连接源图形
+        private Line? _previewConnectionLine; // 连接线预览
         
         #endregion
         
@@ -692,6 +710,20 @@ namespace ElectronicWhiteboard
             }
         }
         
+        // 吸附开关
+        private void OnSnapChanged(object sender, RoutedEventArgs e)
+        {
+            _snapEnabled = chkSnap.IsChecked == true;
+            System.Diagnostics.Debug.WriteLine($"[设置] 吸附: {_snapEnabled}");
+        }
+        
+        // 辅助线开关
+        private void OnGuideLineChanged(object sender, RoutedEventArgs e)
+        {
+            _guideLineEnabled = chkGuideLine.IsChecked == true;
+            System.Diagnostics.Debug.WriteLine($"[设置] 辅助线: {_guideLineEnabled}");
+        }
+        
         private void OnNextPage(object sender, RoutedEventArgs e)
         {
             if (_currentPage < _totalPages)
@@ -954,6 +986,8 @@ namespace ElectronicWhiteboard
                                 _shapeDragStartPoint = clickPos;
                                 SaveSelectedShapesOriginalPositions();
                                 shapeCanvas.CaptureMouse();
+                                e.Handled = true;
+                                return;
                             }
                             else
                             {
@@ -970,7 +1004,7 @@ namespace ElectronicWhiteboard
                         // 清除之前的辅助线
                         ClearGuideLines();
                         
-                        // 保存图形的原始位置
+                        // 保存图形的原始位置（每次拖动都重新获取当前位置）
                         _shapeOriginalPosition = new Point(
                             Canvas.GetLeft(shape),
                             Canvas.GetTop(shape)
@@ -2323,6 +2357,9 @@ namespace ElectronicWhiteboard
                 _currentAdorner.RotationChanged += OnShapeRotationChanged;
                 _adornerLayer.Add(_currentAdorner);
             }
+            
+            // 显示连接点
+            ShowConnectors(shape);
         }
         
         // 取消选择图形
@@ -2354,9 +2391,390 @@ namespace ElectronicWhiteboard
                 
                 _selectedShape = null;
             }
+            
+            // 隐藏连接点
+            HideConnectors();
         }
         
-        // 移动图形
+        #region 连接点功能
+        
+        // 显示图形的连接点
+        private void ShowConnectors(UIElement shape)
+        {
+            // 先隐藏之前的连接点
+            HideConnectors();
+            
+            // 获取图形的 ShapeModel
+            var shapeModel = GetShapeModel(shape);
+            if (shapeModel == null) return;
+            
+            // 获取图形的位置和大小
+            var bounds = GetElementBounds(shape);
+            if (bounds == Rect.Empty) return;
+            
+            // 创建并显示每个连接点
+            foreach (var connector in shapeModel.Connectors)
+            {
+                if (!connector.IsEnabled) continue;
+                
+                var pos = connector.GetAbsolutePosition(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+                
+                var connectorPoint = new Ellipse
+                {
+                    Width = 14,
+                    Height = 14,
+                    Fill = new SolidColorBrush(Color.FromRgb(255, 193, 7)), // 琥珀色
+                    Stroke = Brushes.White,
+                    StrokeThickness = 2,
+                    Tag = $"connector:{connector.Name}",
+                    IsHitTestVisible = true,
+                    Cursor = Cursors.Cross
+                };
+                
+                // 连接点双击事件 - 开始连接
+                connectorPoint.MouseLeftButtonDown += OnConnectorClick;
+                
+                Canvas.SetLeft(connectorPoint, pos.X - 7);
+                Canvas.SetTop(connectorPoint, pos.Y - 7);
+                
+                // 确保在图形上方显示
+                Panel.SetZIndex(connectorPoint, 100);
+                
+                shapeCanvas.Children.Add(connectorPoint);
+                _connectorPoints.Add(connectorPoint);
+            }
+            
+            System.Diagnostics.Debug.WriteLine($"[连接点] 显示 {shapeModel.Connectors.Count} 个连接点");
+        }
+        
+        // 隐藏所有连接点
+        private void HideConnectors()
+        {
+            foreach (var connector in _connectorPoints)
+            {
+                shapeCanvas.Children.Remove(connector);
+            }
+            _connectorPoints.Clear();
+            
+            // 隐藏高亮连接点
+            if (_highlightConnector != null)
+            {
+                shapeCanvas.Children.Remove(_highlightConnector);
+                _highlightConnector = null;
+            }
+            
+            // 取消连接线预览
+            if (_previewConnectionLine != null)
+            {
+                shapeCanvas.Children.Remove(_previewConnectionLine);
+                _previewConnectionLine = null;
+            }
+            
+            _isDraggingToConnect = false;
+            _connectionSourceShape = null;
+        }
+        
+        // 获取 UIElement 对应的 ShapeModel
+        private Models.ShapeModel? GetShapeModel(UIElement element)
+        {
+            if (element is FrameworkElement fe && fe.Tag is Models.ShapeModel model)
+            {
+                return model;
+            }
+            return null;
+        }
+        
+        // 连接点点击事件 - 开始创建连接
+        private void OnConnectorClick(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is Ellipse connector && _selectedShape != null)
+            {
+                // 开始拖动创建连接
+                _isDraggingToConnect = true;
+                _connectionSourceShape = _selectedShape;
+                
+                var pos = e.GetPosition(shapeCanvas);
+                
+                // 创建预览连接线
+                _previewConnectionLine = new Line
+                {
+                    X1 = pos.X,
+                    Y1 = pos.Y,
+                    X2 = pos.X,
+                    Y2 = pos.Y,
+                    Stroke = new SolidColorBrush(Color.FromArgb(180, 255, 193, 7)),
+                    StrokeThickness = 2,
+                    StrokeDashArray = new DoubleCollection { 4, 2 },
+                    Tag = "connection-preview"
+                };
+                
+                Panel.SetZIndex(_previewConnectionLine, 99);
+                shapeCanvas.Children.Add(_previewConnectionLine);
+                
+                shapeCanvas.CaptureMouse();
+                e.Handled = true;
+                
+                // 添加鼠标移动事件来跟踪连接线
+                shapeCanvas.MouseMove += OnConnectorDragMove;
+                shapeCanvas.MouseLeftButtonUp += OnConnectorDragEnd;
+                
+                System.Diagnostics.Debug.WriteLine("[连接点] 开始创建连接");
+            }
+        }
+        
+        // 连接拖动移动事件
+        private void OnConnectorDragMove(object sender, MouseEventArgs e)
+        {
+            if (_isDraggingToConnect && _previewConnectionLine != null)
+            {
+                var pos = e.GetPosition(shapeCanvas);
+                _previewConnectionLine.X2 = pos.X;
+                _previewConnectionLine.Y2 = pos.Y;
+                
+                // 检测是否接近其他图形的连接点
+                CheckConnectionProximity(pos);
+            }
+        }
+        
+        // 检测连接点接近度，显示吸附提示
+        private void CheckConnectionProximity(Point pos)
+        {
+            // 移除之前的高亮
+            if (_highlightConnector != null)
+            {
+                shapeCanvas.Children.Remove(_highlightConnector);
+                _highlightConnector = null;
+            }
+            
+            // 遍历所有图形，寻找接近的连接点
+            foreach (UIElement child in shapeCanvas.Children)
+            {
+                // 跳过自己和非图形元素
+                if (child == _connectionSourceShape) continue;
+                if (child is Ellipse ellipse && ellipse.Tag?.ToString()?.StartsWith("connector:") == true) continue;
+                
+                // 获取图形的 ShapeModel
+                var model = GetShapeModel(child);
+                if (model == null) continue;
+                
+                var bounds = GetElementBounds(child);
+                if (bounds == Rect.Empty) continue;
+                
+                // 检查每个连接点
+                foreach (var connector in model.Connectors)
+                {
+                    if (!connector.IsEnabled) continue;
+                    
+                    var connectorPos = connector.GetAbsolutePosition(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+                    var distance = Math.Sqrt(Math.Pow(pos.X - connectorPos.X, 2) + Math.Pow(pos.Y - connectorPos.Y, 2));
+                    
+                    // 如果距离小于15像素，显示吸附提示
+                    if (distance < 15)
+                    {
+                        _highlightConnector = new Ellipse
+                        {
+                            Width = 20,
+                            Height = 20,
+                            Fill = new SolidColorBrush(Color.FromRgb(76, 175, 80)), // 绿色
+                            Stroke = Brushes.White,
+                            StrokeThickness = 2,
+                            Tag = "connector-highlight"
+                        };
+                        
+                        Canvas.SetLeft(_highlightConnector, connectorPos.X - 10);
+                        Canvas.SetTop(_highlightConnector, connectorPos.Y - 10);
+                        Panel.SetZIndex(_highlightConnector, 101);
+                        
+                        shapeCanvas.Children.Add(_highlightConnector);
+                        
+                        // 保存目标图形信息到 Tag
+                        _highlightConnector.Tag = $"connector-target:{child.GetHashCode()}";
+                        
+                        System.Diagnostics.Debug.WriteLine($"[连接点] 检测到接近: {connector.Name}");
+                        return;
+                    }
+                }
+            }
+        }
+        
+        // 连接拖动结束事件
+        private void OnConnectorDragEnd(object sender, MouseButtonEventArgs e)
+        {
+            // 移除事件处理
+            shapeCanvas.MouseMove -= OnConnectorDragMove;
+            shapeCanvas.MouseLeftButtonUp -= OnConnectorDragEnd;
+            
+            if (_isDraggingToConnect)
+            {
+                var pos = e.GetPosition(shapeCanvas);
+                
+                // 检查是否创建了连接
+                if (_highlightConnector != null)
+                {
+                    var targetTag = _highlightConnector.Tag?.ToString() ?? "";
+                    if (targetTag.StartsWith("connector-target:"))
+                    {
+                        // 查找目标图形（通过 HashCode）
+                        if (int.TryParse(targetTag.Split(':')[1], out int targetHash))
+                        {
+                            UIElement? targetShape = null;
+                            foreach (UIElement child in shapeCanvas.Children)
+                            {
+                                if (child.GetHashCode() == targetHash)
+                                {
+                                    targetShape = child;
+                                    break;
+                                }
+                            }
+                            
+                            if (targetShape != null && _connectionSourceShape != null)
+                            {
+                                // 创建连接
+                                CreateConnection(_connectionSourceShape, targetShape);
+                            }
+                        }
+                    }
+                }
+                
+                // 清理预览
+                if (_previewConnectionLine != null)
+                {
+                    shapeCanvas.Children.Remove(_previewConnectionLine);
+                    _previewConnectionLine = null;
+                }
+                
+                if (_highlightConnector != null)
+                {
+                    shapeCanvas.Children.Remove(_highlightConnector);
+                    _highlightConnector = null;
+                }
+                
+                shapeCanvas.ReleaseMouseCapture();
+                _isDraggingToConnect = false;
+                _connectionSourceShape = null;
+                
+                System.Diagnostics.Debug.WriteLine("[连接点] 连接创建完成");
+            }
+        }
+        
+        // 创建连接关系
+        private void CreateConnection(UIElement source, UIElement target)
+        {
+            // 获取源和目标的 ShapeModel
+            var sourceModel = GetShapeModel(source);
+            var targetModel = GetShapeModel(target);
+            
+            if (sourceModel == null || targetModel == null) return;
+            
+            // 创建连接模型
+            var connection = new Models.ConnectionModel
+            {
+                SourceShapeId = sourceModel.Id,
+                TargetShapeId = targetModel.Id,
+                SourceConnectorIndex = 0, // 使用默认连接点
+                TargetConnectorIndex = 0,
+                StrokeColor = Colors.Gray,
+                StrokeThickness = 2
+            };
+            
+            _connections.Add(connection);
+            
+            // 创建连接线图形
+            var sourceBounds = GetElementBounds(source);
+            var targetBounds = GetElementBounds(target);
+            
+            var sourcePos = GetConnectorPosition(source, sourceModel, 0);
+            var targetPos = GetConnectorPosition(target, targetModel, 0);
+            
+            var connectionLine = new Line
+            {
+                X1 = sourcePos.X,
+                Y1 = sourcePos.Y,
+                X2 = targetPos.X,
+                Y2 = targetPos.Y,
+                Stroke = new SolidColorBrush(Color.FromRgb(158, 158, 158)),
+                StrokeThickness = 2,
+                StrokeStartLineCap = PenLineCap.Round,
+                StrokeEndLineCap = PenLineCap.Round,
+                Tag = $"connection:{connection.Id}"
+            };
+            
+            Panel.SetZIndex(connectionLine, 50);
+            shapeCanvas.Children.Add(connectionLine);
+            _connectionLines.Add(connectionLine);
+            
+            System.Diagnostics.Debug.WriteLine($"[连接点] 创建连接: {sourceModel.Id} -> {targetModel.Id}");
+        }
+        
+        // 获取图形的连接点绝对坐标
+        private Point GetConnectorPosition(UIElement element, Models.ShapeModel model, int connectorIndex)
+        {
+            var bounds = GetElementBounds(element);
+            if (bounds == Rect.Empty || connectorIndex >= model.Connectors.Count)
+            {
+                return new Point(0, 0);
+            }
+            
+            var connector = model.Connectors[connectorIndex];
+            return connector.GetAbsolutePosition(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+        }
+        
+        // 更新所有连接线（当图形移动时调用）
+        private void UpdateConnections(UIElement movedShape)
+        {
+            var movedModel = GetShapeModel(movedShape);
+            if (movedModel == null) return;
+            
+            var bounds = GetElementBounds(movedShape);
+            if (bounds == Rect.Empty) return;
+            
+            // 遍历所有连接线，更新涉及移动图形的
+            for (int i = 0; i < _connectionLines.Count; i++)
+            {
+                var line = _connectionLines[i];
+                if (line.Tag is not string tag || !tag.StartsWith("connection:")) continue;
+                
+                var connectionId = Guid.Parse(tag.Split(':')[1]);
+                var connection = _connections.FirstOrDefault(c => c.Id == connectionId);
+                
+                if (connection == null) continue;
+                
+                // 查找源和目标图形
+                UIElement? sourceShape = null;
+                UIElement? targetShape = null;
+                
+                foreach (UIElement child in shapeCanvas.Children)
+                {
+                    var model = GetShapeModel(child);
+                    if (model == null) continue;
+                    
+                    if (model.Id == connection.SourceShapeId) sourceShape = child;
+                    if (model.Id == connection.TargetShapeId) targetShape = child;
+                }
+                
+                // 更新连接线位置
+                if (sourceShape != null && targetShape != null)
+                {
+                    var sourceModel = GetShapeModel(sourceShape);
+                    var targetModel = GetShapeModel(targetShape);
+                    
+                    if (sourceModel != null && targetModel != null)
+                    {
+                        var sourcePos = GetConnectorPosition(sourceShape, sourceModel, connection.SourceConnectorIndex);
+                        var targetPos = GetConnectorPosition(targetShape, targetModel, connection.TargetConnectorIndex);
+                        
+                        line.X1 = sourcePos.X;
+                        line.Y1 = sourcePos.Y;
+                        line.X2 = targetPos.X;
+                        line.Y2 = targetPos.Y;
+                    }
+                }
+            }
+        }
+        
+        #endregion
+        
+        // 移动图形（带吸附和辅助线功能）
         private void MoveShape(Point currentPos)
         {
             if (_selectedShape != null)
@@ -2369,15 +2787,136 @@ namespace ElectronicWhiteboard
                 double newLeft = _shapeOriginalPosition.X + offsetX;
                 double newTop = _shapeOriginalPosition.Y + offsetY;
                 
+                // 检查吸附（仅在开启时）
+                if (_snapEnabled)
+                {
+                    var snapResult = CalculateSnapPosition(_selectedShape, newLeft, newTop);
+                    if (snapResult.HasValue)
+                    {
+                        newLeft = snapResult.Value.X;
+                        newTop = snapResult.Value.Y;
+                    }
+                }
+                
                 Canvas.SetLeft(_selectedShape, newLeft);
                 Canvas.SetTop(_selectedShape, newTop);
                 
                 // 更新 ShapeModel 坐标
                 UpdateShapeModelPosition(_selectedShape, newLeft, newTop);
                 
-                // 显示辅助线
-                UpdateGuideLines(_selectedShape, currentPos);
+                // 显示辅助线（仅在开启时）
+                if (_guideLineEnabled)
+                {
+                    UpdateGuideLines(_selectedShape, currentPos);
+                }
+                
+                // 更新连接线（移动时实时跟随）
+                UpdateConnections(_selectedShape);
+                
+                // 同步更新连接点位置
+                if (_connectorPoints.Count > 0)
+                {
+                    ShowConnectors(_selectedShape);
+                }
             }
+        }
+        
+        // 计算吸附位置 - 简化版
+        // 当图形与其他图形/画布边缘距离 < 5px 时，自动吸附对齐
+        private Point? CalculateSnapPosition(UIElement shape, double left, double top)
+        {
+            var bounds = GetElementBounds(shape);
+            if (bounds == Rect.Empty) return null;
+            
+            double snapX = left;
+            double snapY = top;
+            bool snapped = false;
+            
+            // 画布边缘吸附
+            if (shapeCanvas.ActualWidth > 0 && shapeCanvas.ActualHeight > 0)
+            {
+                // 画布左侧
+                if (Math.Abs(left) < SNAP_THRESHOLD)
+                {
+                    snapX = 0;
+                    snapped = true;
+                }
+                // 画布右侧
+                else if (Math.Abs(left + bounds.Width - shapeCanvas.ActualWidth) < SNAP_THRESHOLD)
+                {
+                    snapX = shapeCanvas.ActualWidth - bounds.Width;
+                    snapped = true;
+                }
+                
+                // 画布顶部
+                if (Math.Abs(top) < SNAP_THRESHOLD)
+                {
+                    snapY = 0;
+                    snapped = true;
+                }
+                // 画布底部
+                else if (Math.Abs(top + bounds.Height - shapeCanvas.ActualHeight) < SNAP_THRESHOLD)
+                {
+                    snapY = shapeCanvas.ActualHeight - bounds.Height;
+                    snapped = true;
+                }
+            }
+            
+            // 与其他图形吸附
+            foreach (UIElement child in shapeCanvas.Children)
+            {
+                if (child == shape) continue;
+                if (child is Rectangle rect && (rect.Tag?.ToString() == "selection-box" || rect.Tag?.ToString() == "guide-line")) continue;
+                if (child is Ellipse ellipse && ellipse.Tag?.ToString() == "polygon-vertex") continue;
+                if (child is Line line && line.Tag?.ToString() == "guide-line") continue;
+                
+                var otherBounds = GetElementBounds(child);
+                if (otherBounds == Rect.Empty) continue;
+                
+                // 垂直方向吸附（左边对齐、右边对齐、中心对齐）
+                double distLeft = Math.Abs(left - otherBounds.Left);
+                double distRight = Math.Abs(left + bounds.Width - otherBounds.Right);
+                double distCenterX = Math.Abs((left + bounds.Width / 2) - (otherBounds.Left + otherBounds.Width / 2));
+                
+                if (distLeft < SNAP_THRESHOLD)
+                {
+                    snapX = otherBounds.Left;
+                    snapped = true;
+                }
+                else if (distRight < SNAP_THRESHOLD)
+                {
+                    snapX = otherBounds.Right - bounds.Width;
+                    snapped = true;
+                }
+                else if (distCenterX < SNAP_THRESHOLD)
+                {
+                    snapX = otherBounds.Left + otherBounds.Width / 2 - bounds.Width / 2;
+                    snapped = true;
+                }
+                
+                // 水平方向吸附（顶边对齐、底边对齐、中心对齐）
+                double distTop = Math.Abs(top - otherBounds.Top);
+                double distBottom = Math.Abs(top + bounds.Height - otherBounds.Bottom);
+                double distCenterY = Math.Abs((top + bounds.Height / 2) - (otherBounds.Top + otherBounds.Height / 2));
+                
+                if (distTop < SNAP_THRESHOLD)
+                {
+                    snapY = otherBounds.Top;
+                    snapped = true;
+                }
+                else if (distBottom < SNAP_THRESHOLD)
+                {
+                    snapY = otherBounds.Bottom - bounds.Height;
+                    snapped = true;
+                }
+                else if (distCenterY < SNAP_THRESHOLD)
+                {
+                    snapY = otherBounds.Top + otherBounds.Height / 2 - bounds.Height / 2;
+                    snapped = true;
+                }
+            }
+            
+            return snapped ? new Point(snapX, snapY) : null;
         }
         
         // 更新 ShapeModel 的坐标
@@ -2494,6 +3033,7 @@ namespace ElectronicWhiteboard
                     double otherCenterY = otherBounds.Top + otherBounds.Height / 2;
                     double otherTop = otherBounds.Top;
                     double otherLeft = otherBounds.Left;
+                    double otherRight = otherBounds.Right;
                     
                     // 水平对齐检测（顶部、底部、居中）
                     if (!hasHorizontalGuide)
@@ -2502,51 +3042,25 @@ namespace ElectronicWhiteboard
                             Math.Abs(bottom - otherBounds.Bottom) < GUIDE_SNAP_DISTANCE ||
                             Math.Abs(centerY - otherCenterY) < GUIDE_SNAP_DISTANCE)
                         {
-                            // 水平辅助线 - 画一条贯穿画布的水平线
-                            _horizontalGuideLine = new Line
-                            {
-                                X1 = 0,
-                                X2 = shapeCanvas.ActualWidth,
-                                Y1 = otherTop,
-                            Y2 = otherTop,
-                            Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色
-                            StrokeThickness = 2,
-                            StrokeDashArray = new DoubleCollection { 5, 3 },
-                            Tag = "guide-line",
-                            IsHitTestVisible = false
-                        };
-                        shapeCanvas.Children.Add(_horizontalGuideLine);
-                        hasHorizontalGuide = true;
+                            ShowHorizontalGuide(otherTop, "与其他图形水平对齐");
+                            hasHorizontalGuide = true;
+                        }
                     }
-                }
-                
-                // 垂直对齐检测（左侧、右侧、居中）
-                if (!hasVerticalGuide)
-                {
-                    if (Math.Abs(left - otherLeft) < GUIDE_SNAP_DISTANCE ||
-                        Math.Abs(right - otherBounds.Right) < GUIDE_SNAP_DISTANCE ||
-                        Math.Abs(centerX - otherCenterX) < GUIDE_SNAP_DISTANCE)
+                    
+                    // 垂直对齐检测（左侧、右侧、居中）
+                    if (!hasVerticalGuide)
                     {
-                        // 垂直辅助线 - 画一条贯穿画布的垂直线
-                        _verticalGuideLine = new Line
+                        if (Math.Abs(left - otherLeft) < GUIDE_SNAP_DISTANCE ||
+                            Math.Abs(right - otherRight) < GUIDE_SNAP_DISTANCE ||
+                            Math.Abs(centerX - otherCenterX) < GUIDE_SNAP_DISTANCE)
                         {
-                            X1 = otherLeft,
-                            X2 = otherLeft,
-                            Y1 = 0,
-                            Y2 = shapeCanvas.ActualHeight,
-                            Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色
-                            StrokeThickness = 2,
-                            StrokeDashArray = new DoubleCollection { 5, 3 },
-                            Tag = "guide-line",
-                            IsHitTestVisible = false
-                        };
-                        shapeCanvas.Children.Add(_verticalGuideLine);
-                        hasVerticalGuide = true;
+                            ShowVerticalGuide(otherLeft, "与其他图形垂直对齐");
+                            hasVerticalGuide = true;
+                        }
                     }
+                    
+                    if (hasHorizontalGuide && hasVerticalGuide) break;
                 }
-                
-                if (hasHorizontalGuide && hasVerticalGuide) break;
-            }
             }
             catch (Exception ex)
             {
@@ -2851,6 +3365,9 @@ namespace ElectronicWhiteboard
                 _adornerLayer.Remove(_currentAdorner);
                 _currentAdorner = null;
             }
+            
+            // 隐藏连接点
+            HideConnectors();
         }
         
         // 切换图形选中状态（Ctrl+点击时使用）
@@ -2905,6 +3422,7 @@ namespace ElectronicWhiteboard
             double offsetX = currentPos.X - _shapeDragStartPoint.X;
             double offsetY = currentPos.Y - _shapeDragStartPoint.Y;
             
+            // 批量移动所有选中的图形
             foreach (var shape in _selectedShapes)
             {
                 if (_selectedShapesOriginalPositions.TryGetValue(shape, out var originalPos))
@@ -2920,10 +3438,16 @@ namespace ElectronicWhiteboard
                 }
             }
             
-            // 显示辅助线（使用第一个选中的图形作为参考）
-            if (_selectedShapes.Count > 0)
+            // 更新所有涉及的连接线
+            foreach (var shape in _selectedShapes)
             {
-                UpdateGuideLines(_selectedShapes[0], currentPos);
+                UpdateConnections(shape);
+            }
+            
+            // 同步更新连接点位置
+            if (_selectedShapes.Count == 1 && _connectorPoints.Count > 0)
+            {
+                ShowConnectors(_selectedShapes[0]);
             }
         }
         
@@ -2970,8 +3494,16 @@ namespace ElectronicWhiteboard
         {
             if (_selectedShapes.Count == 0) return;
             
+            // 记录要删除的图形ID
+            var deletedIds = new List<Guid>();
             foreach (var shape in _selectedShapes.ToList())
             {
+                var model = GetShapeModel(shape);
+                if (model != null)
+                {
+                    deletedIds.Add(model.Id);
+                }
+                
                 // 从画布移除
                 shapeCanvas.Children.Remove(shape);
                 
@@ -2983,11 +3515,61 @@ namespace ElectronicWhiteboard
                 _polygons.Remove(shape);
             }
             
+            // 删除相关的连接线
+            DeleteConnectionsForShapes(deletedIds);
+            
             var count = _selectedShapes.Count;
             _selectedShapes.Clear();
             _selectedShape = null;
             
+            // 隐藏连接点
+            HideConnectors();
+            
             System.Diagnostics.Debug.WriteLine($"[选择] 删除了 {count} 个图形");
+        }
+        
+        // 删除与指定图形相关的所有连接
+        private void DeleteConnectionsForShapes(List<Guid> shapeIds)
+        {
+            var connectionsToRemove = new List<Models.ConnectionModel>();
+            var linesToRemove = new List<Line>();
+            
+            foreach (var connection in _connections)
+            {
+                if (shapeIds.Contains(connection.SourceShapeId) || shapeIds.Contains(connection.TargetShapeId))
+                {
+                    connectionsToRemove.Add(connection);
+                }
+            }
+            
+            foreach (var line in _connectionLines)
+            {
+                var tag = line.Tag?.ToString() ?? "";
+                if (tag.StartsWith("connection:"))
+                {
+                    var connId = Guid.Parse(tag.Split(':')[1]);
+                    if (connectionsToRemove.Any(c => c.Id == connId))
+                    {
+                        linesToRemove.Add(line);
+                    }
+                }
+            }
+            
+            foreach (var connection in connectionsToRemove)
+            {
+                _connections.Remove(connection);
+            }
+            
+            foreach (var line in linesToRemove)
+            {
+                shapeCanvas.Children.Remove(line);
+                _connectionLines.Remove(line);
+            }
+            
+            if (connectionsToRemove.Count > 0)
+            {
+                System.Diagnostics.Debug.WriteLine($"[连接点] 删除了 {connectionsToRemove.Count} 条连接线");
+            }
         }
         
         #endregion
