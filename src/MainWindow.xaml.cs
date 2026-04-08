@@ -105,6 +105,13 @@ namespace ElectronicWhiteboard
         private Point _shapeDragStartPoint;
         private Point _shapeOriginalPosition;
         
+        // 框选相关字段
+        private bool _isSelectingByBox = false; // 是否正在进行框选
+        private Point _selectionBoxStartPoint; // 框选起点
+        private Rectangle? _selectionBox; // 框选矩形（虚线）
+        private readonly List<UIElement> _selectedShapes = new(); // 选中的多个图形
+        private bool _isDraggingSelection = false; // 是否在拖动已选中的图形组
+        
         #endregion
         
         #region 构造函数
@@ -870,6 +877,20 @@ namespace ElectronicWhiteboard
                 MoveShape(currentPos);
             }
             
+            // 框选时的实时更新
+            if (_isSelectingByBox && _selectionBox != null)
+            {
+                var currentPos = e.GetPosition(shapeCanvas);
+                UpdateSelectionBox(currentPos);
+            }
+            
+            // 拖动已选中的图形组
+            if (_isDraggingSelection)
+            {
+                var currentPos = e.GetPosition(shapeCanvas);
+                MoveSelectedShapes(currentPos);
+            }
+            
             var pos = e.GetPosition(shapeCanvas);
             // 可以显示坐标信息
         }
@@ -881,11 +902,20 @@ namespace ElectronicWhiteboard
             if (_currentTool == ToolType.Select)
             {
                 var clickedElement = e.OriginalSource as FrameworkElement;
+                var clickPos = e.GetPosition(shapeCanvas);
                 
-                // 如果点击的是背景（canvas本身），取消选中
+                // 如果点击的是背景（canvas本身）
                 if (clickedElement == shapeCanvas)
                 {
-                    DeselectShape();
+                    // 如果已经有选中的图形，点击空白处取消选中
+                    if (_selectedShapes.Count > 0)
+                    {
+                        DeselectAllShapes();
+                        return;
+                    }
+                    
+                    // 开始框选
+                    StartSelectionBox(clickPos);
                     return;
                 }
                 
@@ -896,12 +926,33 @@ namespace ElectronicWhiteboard
                     var tagStr = (shape as FrameworkElement)?.Tag?.ToString() ?? "";
                     if (tagStr != "polygon-vertex")
                     {
-                        // 选中图形
-                        SelectShape(shape);
+                        // Ctrl+点击：追加/取消选中
+                        if (Keyboard.Modifiers == ModifierKeys.Control)
+                        {
+                            ToggleShapeSelection(shape);
+                        }
+                        else
+                        {
+                            // 检查是否已经选中
+                            if (_selectedShapes.Contains(shape))
+                            {
+                                // 已经开始拖动已选中的图形组
+                                _isDraggingSelection = true;
+                                _shapeDragStartPoint = clickPos;
+                                SaveSelectedShapesOriginalPositions();
+                                shapeCanvas.CaptureMouse();
+                            }
+                            else
+                            {
+                                // 取消之前的选中，选中新的图形
+                                DeselectAllShapes();
+                                SelectShape(shape);
+                            }
+                        }
                         
                         // 开始拖动
                         _isMovingShape = true;
-                        _shapeDragStartPoint = e.GetPosition(shapeCanvas);
+                        _shapeDragStartPoint = clickPos;
                         
                         // 保存图形的原始位置
                         _shapeOriginalPosition = new Point(
@@ -1416,6 +1467,22 @@ namespace ElectronicWhiteboard
                 _isMovingShape = false;
                 shapeCanvas.ReleaseMouseCapture();
                 System.Diagnostics.Debug.WriteLine("[选择] 移动完成");
+                return;
+            }
+            
+            // 框选结束
+            if (_isSelectingByBox)
+            {
+                EndSelectionBox(e.GetPosition(shapeCanvas));
+                return;
+            }
+            
+            // 拖动选中图形组结束
+            if (_isDraggingSelection)
+            {
+                _isDraggingSelection = false;
+                shapeCanvas.ReleaseMouseCapture();
+                System.Diagnostics.Debug.WriteLine("[选择] 批量移动完成");
                 return;
             }
             
@@ -2154,18 +2221,29 @@ namespace ElectronicWhiteboard
         // 选择图形
         private void SelectShape(UIElement shape)
         {
-            DeselectShape();
+            // 清除之前的单选选中（但保留框选的多个图形）
+            if (_selectedShape != null && !_selectedShapes.Contains(_selectedShape))
+            {
+                RemoveSelectionHighlight(_selectedShape);
+            }
+            
             _selectedShape = shape;
+            
+            // 如果不在选中列表中，添加进去
+            if (!_selectedShapes.Contains(shape))
+            {
+                _selectedShapes.Add(shape);
+            }
             
             // 添加选中效果（例如边框或阴影）
             if (shape is Shape s)
             {
-                s.Stroke = new SolidColorBrush(Colors.Red);
+                s.Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217));
                 s.StrokeThickness = s.StrokeThickness + 2;
             }
             else if (shape is Path p)
             {
-                p.Stroke = new SolidColorBrush(Colors.Red);
+                p.Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217));
                 p.StrokeThickness = p.StrokeThickness + 2;
             }
         }
@@ -2175,6 +2253,9 @@ namespace ElectronicWhiteboard
         {
             if (_selectedShape != null)
             {
+                // 从选中列表中移除
+                _selectedShapes.Remove(_selectedShape);
+                
                 // 恢复原始样式
                 if (_selectedShape is Shape s)
                 {
@@ -2210,6 +2291,309 @@ namespace ElectronicWhiteboard
         
         #endregion
         
+        #region 框选方法
+        
+        // 开始框选
+        private void StartSelectionBox(Point startPoint)
+        {
+            // 如果没有按住Ctrl，先取消所有选中
+            if (Keyboard.Modifiers != ModifierKeys.Control)
+            {
+                DeselectAllShapes();
+            }
+            
+            _isSelectingByBox = true;
+            _selectionBoxStartPoint = startPoint;
+            
+            // 创建虚线选择框
+            _selectionBox = new Rectangle
+            {
+                Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 4, 2 },
+                Fill = new SolidColorBrush(Color.FromArgb(30, 74, 144, 217)),
+                Tag = "selection-box"
+            };
+            
+            // 设置初始位置和大小
+            Canvas.SetLeft(_selectionBox, startPoint.X);
+            Canvas.SetTop(_selectionBox, startPoint.Y);
+            _selectionBox.Width = 0;
+            _selectionBox.Height = 0;
+            
+            shapeCanvas.Children.Add(_selectionBox);
+            shapeCanvas.CaptureMouse();
+        }
+        
+        // 更新框选矩形
+        private void UpdateSelectionBox(Point currentPoint)
+        {
+            if (_selectionBox == null) return;
+            
+            double x = Math.Min(_selectionBoxStartPoint.X, currentPoint.X);
+            double y = Math.Min(_selectionBoxStartPoint.Y, currentPoint.Y);
+            double width = Math.Abs(currentPoint.X - _selectionBoxStartPoint.X);
+            double height = Math.Abs(currentPoint.Y - _selectionBoxStartPoint.Y);
+            
+            Canvas.SetLeft(_selectionBox, x);
+            Canvas.SetTop(_selectionBox, y);
+            _selectionBox.Width = width;
+            _selectionBox.Height = height;
+        }
+        
+        // 结束框选，选中框内的图形
+        private void EndSelectionBox(Point endPoint)
+        {
+            _isSelectingByBox = false;
+            shapeCanvas.ReleaseMouseCapture();
+            
+            if (_selectionBox == null) return;
+            
+            // 计算选择框的区域
+            double x = Math.Min(_selectionBoxStartPoint.X, endPoint.X);
+            double y = Math.Min(_selectionBoxStartPoint.Y, endPoint.Y);
+            double width = Math.Abs(endPoint.X - _selectionBoxStartPoint.X);
+            double height = Math.Abs(endPoint.Y - _selectionBoxStartPoint.Y);
+            
+            // 移除选择框
+            shapeCanvas.Children.Remove(_selectionBox);
+            _selectionBox = null;
+            
+            // 太小的选择框忽略（避免误操作）
+            if (width < 5 || height < 5)
+            {
+                return;
+            }
+            
+            // 查找框内的所有图形
+            var shapesInBox = GetShapesInRect(x, y, width, height);
+            
+            // 添加到选中列表
+            foreach (var shape in shapesInBox)
+            {
+                if (!_selectedShapes.Contains(shape))
+                {
+                    _selectedShapes.Add(shape);
+                    AddSelectionHighlight(shape);
+                }
+            }
+            
+            if (_selectedShapes.Count > 0)
+            {
+                System.Diagnostics.Debug.WriteLine($"[框选] 选中 {_selectedShapes.Count} 个图形");
+            }
+        }
+        
+        // 获取指定矩形区域内的所有图形
+        private List<UIElement> GetShapesInRect(double x, double y, double width, double height)
+        {
+            var result = new List<UIElement>();
+            
+            // 创建选择区域
+            var selectionRect = new Rect(x, y, width, height);
+            
+            foreach (UIElement child in shapeCanvas.Children)
+            {
+                // 跳过选择框本身和顶点标记
+                if (child is Rectangle rect && rect.Tag?.ToString() == "selection-box")
+                    continue;
+                if (child is Ellipse ellipse && ellipse.Tag?.ToString() == "polygon-vertex")
+                    continue;
+                
+                // 获取图形的边界
+                var bounds = GetElementBounds(child);
+                if (bounds == Rect.Empty) continue;
+                
+                // 检查是否与选择区域相交
+                if (selectionRect.IntersectsWith(bounds))
+                {
+                    result.Add(child);
+                }
+            }
+            
+            return result;
+        }
+        
+        // 获取元素的边界矩形
+        private Rect GetElementBounds(UIElement element)
+        {
+            double left = 0, top = 0, width = 0, height = 0;
+            
+            if (element is Shape shape)
+            {
+                // 对于基本形状
+                left = Canvas.GetLeft(element);
+                top = Canvas.GetTop(element);
+                
+                if (double.IsNaN(left)) left = 0;
+                if (double.IsNaN(top)) top = 0;
+                
+                if (shape is Line line)
+                {
+                    // 直线需要特殊处理
+                    double x1 = line.X1, y1 = line.Y1, x2 = line.X2, y2 = line.Y2;
+                    left = Math.Min(x1, x2) + left;
+                    top = Math.Min(y1, y2) + top;
+                    width = Math.Abs(x2 - x1);
+                    height = Math.Abs(y2 - y1);
+                }
+                else
+                {
+                    width = shape.Width;
+                    height = shape.Height;
+                    if (double.IsNaN(width)) width = 0;
+                    if (double.IsNaN(height)) height = 0;
+                }
+            }
+            else if (element is Path path)
+            {
+                // 对于路径（三角形、多边形等）
+                left = Canvas.GetLeft(element);
+                top = Canvas.GetTop(element);
+                
+                if (double.IsNaN(left)) left = 0;
+                if (double.IsNaN(top)) top = 0;
+                
+                // 获取Path的边界
+                if (path.Data is PathGeometry pathGeom)
+                {
+                    var bounds = pathGeom.Bounds;
+                    width = bounds.Width;
+                    height = bounds.Height;
+                    left = bounds.Left;
+                    top = bounds.Top;
+                }
+            }
+            else
+            {
+                // 其他元素
+                left = Canvas.GetLeft(element);
+                top = Canvas.GetTop(element);
+                
+                if (double.IsNaN(left)) left = 0;
+                if (double.IsNaN(top)) top = 0;
+            }
+            
+            // 如果边界无效，返回空矩形
+            if (width <= 0 || height <= 0)
+                return Rect.Empty;
+            
+            return new Rect(left, top, width, height);
+        }
+        
+        // 添加选中高亮效果
+        private void AddSelectionHighlight(UIElement shape)
+        {
+            if (shape is Shape s)
+            {
+                // 保存原始边框到Tag中（如果是Path则特殊处理）
+                var originalStroke = s.Stroke;
+                var originalThickness = s.StrokeThickness;
+                
+                // 设置高亮样式
+                s.Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217));
+                s.StrokeThickness = s.StrokeThickness + 2;
+            }
+            else if (shape is Path p)
+            {
+                p.Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217));
+                p.StrokeThickness = p.StrokeThickness + 2;
+            }
+        }
+        
+        // 移除选中高亮效果
+        private void RemoveSelectionHighlight(UIElement shape)
+        {
+            if (shape is Shape s)
+            {
+                s.Stroke = new SolidColorBrush(_currentColor);
+                s.StrokeThickness = Math.Max(1, s.StrokeThickness - 2);
+            }
+            else if (shape is Path p)
+            {
+                p.Stroke = new SolidColorBrush(_currentColor);
+                p.StrokeThickness = Math.Max(1, p.StrokeThickness - 2);
+            }
+        }
+        
+        // 取消所有图形选中
+        private void DeselectAllShapes()
+        {
+            foreach (var shape in _selectedShapes.ToList())
+            {
+                RemoveSelectionHighlight(shape);
+            }
+            _selectedShapes.Clear();
+            _selectedShape = null;
+        }
+        
+        // 切换图形选中状态（Ctrl+点击时使用）
+        private void ToggleShapeSelection(UIElement shape)
+        {
+            if (_selectedShapes.Contains(shape))
+            {
+                // 取消选中
+                _selectedShapes.Remove(shape);
+                RemoveSelectionHighlight(shape);
+                
+                if (_selectedShape == shape)
+                {
+                    _selectedShape = _selectedShapes.FirstOrDefault();
+                }
+            }
+            else
+            {
+                // 添加选中
+                _selectedShapes.Add(shape);
+                AddSelectionHighlight(shape);
+                _selectedShape = shape;
+            }
+        }
+        
+        // 保存所有选中图形的原始位置
+        private Dictionary<UIElement, Point> _selectedShapesOriginalPositions = new();
+        
+        private void SaveSelectedShapesOriginalPositions()
+        {
+            _selectedShapesOriginalPositions.Clear();
+            
+            foreach (var shape in _selectedShapes)
+            {
+                var pos = new Point(
+                    Canvas.GetLeft(shape),
+                    Canvas.GetTop(shape)
+                );
+                
+                if (double.IsNaN(pos.X)) pos.X = 0;
+                if (double.IsNaN(pos.Y)) pos.Y = 0;
+                
+                _selectedShapesOriginalPositions[shape] = pos;
+            }
+        }
+        
+        // 移动所有选中的图形
+        private void MoveSelectedShapes(Point currentPos)
+        {
+            if (_selectedShapes.Count == 0) return;
+            
+            double offsetX = currentPos.X - _shapeDragStartPoint.X;
+            double offsetY = currentPos.Y - _shapeDragStartPoint.Y;
+            
+            foreach (var shape in _selectedShapes)
+            {
+                if (_selectedShapesOriginalPositions.TryGetValue(shape, out var originalPos))
+                {
+                    double newLeft = originalPos.X + offsetX;
+                    double newTop = originalPos.Y + offsetY;
+                    
+                    Canvas.SetLeft(shape, newLeft);
+                    Canvas.SetTop(shape, newTop);
+                }
+            }
+        }
+        
+        #endregion
+        
         #region 键盘事件
         
         private void OnKeyDown(object sender, KeyEventArgs e)
@@ -2226,12 +2610,49 @@ namespace ElectronicWhiteboard
                 OnRedo(this, new RoutedEventArgs());
                 e.Handled = true;
             }
+            // Delete 删除选中的图形
+            else if (e.Key == Key.Delete)
+            {
+                DeleteSelectedShapes();
+                e.Handled = true;
+            }
+            // Escape 取消选中
+            else if (e.Key == Key.Escape)
+            {
+                DeselectAllShapes();
+                e.Handled = true;
+            }
             // F11 全屏
             else if (e.Key == Key.F11)
             {
                 OnFullScreen(this, new RoutedEventArgs());
                 e.Handled = true;
             }
+        }
+        
+        // 删除选中的图形
+        private void DeleteSelectedShapes()
+        {
+            if (_selectedShapes.Count == 0) return;
+            
+            foreach (var shape in _selectedShapes.ToList())
+            {
+                // 从画布移除
+                shapeCanvas.Children.Remove(shape);
+                
+                // 从相关列表中移除
+                _shapes.Remove(shape);
+                _rectangles.Remove(shape);
+                _ellipses.Remove(shape);
+                _triangles.Remove(shape);
+                _polygons.Remove(shape);
+            }
+            
+            var count = _selectedShapes.Count;
+            _selectedShapes.Clear();
+            _selectedShape = null;
+            
+            System.Diagnostics.Debug.WriteLine($"[选择] 删除了 {count} 个图形");
         }
         
         #endregion
