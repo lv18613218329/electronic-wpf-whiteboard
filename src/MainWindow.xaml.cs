@@ -112,6 +112,11 @@ namespace ElectronicWhiteboard
         private readonly List<UIElement> _selectedShapes = new(); // 选中的多个图形
         private bool _isDraggingSelection = false; // 是否在拖动已选中的图形组
         
+        // 辅助线相关字段
+        private Line? _horizontalGuideLine; // 水平对齐辅助线
+        private Line? _verticalGuideLine; // 垂直对齐辅助线
+        private const double GUIDE_SNAP_DISTANCE = 10; // 辅助线吸附距离
+        
         #endregion
         
         #region 构造函数
@@ -269,7 +274,7 @@ namespace ElectronicWhiteboard
                     toolHintPanel.Visibility = Visibility.Visible;
                     inkCanvas.EditingMode = InkCanvasEditingMode.Select;
                     // 选择工具下允许移动 shapeCanvas 上的图形
-                    shapeCanvas.Cursor = Cursors.Arrow;
+                    shapeCanvas.Cursor = Cursors.Hand;
                     break;
                     
                 case ToolType.Text:
@@ -954,6 +959,9 @@ namespace ElectronicWhiteboard
                         _isMovingShape = true;
                         _shapeDragStartPoint = clickPos;
                         
+                        // 清除之前的辅助线
+                        ClearGuideLines();
+                        
                         // 保存图形的原始位置
                         _shapeOriginalPosition = new Point(
                             Canvas.GetLeft(shape),
@@ -1466,6 +1474,8 @@ namespace ElectronicWhiteboard
             {
                 _isMovingShape = false;
                 shapeCanvas.ReleaseMouseCapture();
+                // 清除辅助线
+                ClearGuideLines();
                 System.Diagnostics.Debug.WriteLine("[选择] 移动完成");
                 return;
             }
@@ -2286,6 +2296,229 @@ namespace ElectronicWhiteboard
                 
                 Canvas.SetLeft(_selectedShape, newLeft);
                 Canvas.SetTop(_selectedShape, newTop);
+                
+                // 更新 ShapeModel 坐标
+                UpdateShapeModelPosition(_selectedShape, newLeft, newTop);
+                
+                // 显示辅助线
+                UpdateGuideLines(_selectedShape, currentPos);
+            }
+        }
+        
+        // 更新 ShapeModel 的坐标
+        private void UpdateShapeModelPosition(UIElement shape, double x, double y)
+        {
+            // 检查是否已有关联的 ShapeModel（可以通过 Tag 存储）
+            if (shape is FrameworkElement fe && fe.Tag is Models.ShapeModel model)
+            {
+                model.X = x;
+                model.Y = y;
+                System.Diagnostics.Debug.WriteLine($"[ShapeModel] 更新坐标: X={x:F0}, Y={y:F0}");
+            }
+        }
+        
+        // 更新辅助线
+        private void UpdateGuideLines(UIElement shape, Point currentPos)
+        {
+            try
+            {
+                // 先清除之前的辅助线
+                ClearGuideLines();
+                
+                // 检查画布尺寸有效性
+                if (shapeCanvas.ActualWidth <= 0 || shapeCanvas.ActualHeight <= 0 ||
+                    double.IsNaN(shapeCanvas.ActualWidth) || double.IsNaN(shapeCanvas.ActualHeight))
+                    return;
+                
+                // 获取当前图形的边界
+                var bounds = GetElementBounds(shape);
+                if (bounds == Rect.Empty) return;
+                
+                double centerX = bounds.Left + bounds.Width / 2;
+                double centerY = bounds.Top + bounds.Height / 2;
+                double left = bounds.Left;
+                double right = bounds.Right;
+                double top = bounds.Top;
+                double bottom = bounds.Bottom;
+                
+                // 画布尺寸
+                double canvasWidth = shapeCanvas.ActualWidth;
+                double canvasHeight = shapeCanvas.ActualHeight;
+                double canvasCenterX = canvasWidth / 2;
+                double canvasCenterY = canvasHeight / 2;
+                
+                bool hasHorizontalGuide = false;
+                bool hasVerticalGuide = false;
+                
+                // === 检测与画布边缘和居中的对齐 ===
+                
+                // 水平方向：画布顶部、底部、居中
+                if (!hasHorizontalGuide)
+                {
+                    if (Math.Abs(top) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowHorizontalGuide(0, "画布顶部");
+                        hasHorizontalGuide = true;
+                    }
+                    else if (Math.Abs(bottom - canvasHeight) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowHorizontalGuide(canvasHeight, "画布底部");
+                        hasHorizontalGuide = true;
+                    }
+                    else if (Math.Abs(centerY - canvasCenterY) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowHorizontalGuide(canvasCenterY, "画布居中");
+                        hasHorizontalGuide = true;
+                    }
+                }
+                
+                // 垂直方向：画布左侧、右侧、居中
+                if (!hasVerticalGuide)
+                {
+                    if (Math.Abs(left) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowVerticalGuide(0, "画布左侧");
+                        hasVerticalGuide = true;
+                    }
+                    else if (Math.Abs(right - canvasWidth) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowVerticalGuide(canvasWidth, "画布右侧");
+                        hasVerticalGuide = true;
+                    }
+                    else if (Math.Abs(centerX - canvasCenterX) < GUIDE_SNAP_DISTANCE)
+                    {
+                        ShowVerticalGuide(canvasCenterX, "画布居中");
+                        hasVerticalGuide = true;
+                    }
+                }
+                
+                // === 检测与其他图形的对齐关系 ===
+                foreach (UIElement child in shapeCanvas.Children)
+                {
+                    // 跳过自己、选择框和顶点标记
+                    if (child == shape) continue;
+                    if (child is Rectangle rect && (rect.Tag?.ToString() == "selection-box" || rect.Tag?.ToString() == "guide-line")) continue;
+                    if (child is Ellipse ellipse && ellipse.Tag?.ToString() == "polygon-vertex") continue;
+                    if (child is Line line && line.Tag?.ToString() == "guide-line") continue;
+                    
+                    var otherBounds = GetElementBounds(child);
+                    if (otherBounds == Rect.Empty) continue;
+                    
+                    double otherCenterX = otherBounds.Left + otherBounds.Width / 2;
+                    double otherCenterY = otherBounds.Top + otherBounds.Height / 2;
+                    double otherTop = otherBounds.Top;
+                    double otherLeft = otherBounds.Left;
+                    
+                    // 水平对齐检测（顶部、底部、居中）
+                    if (!hasHorizontalGuide)
+                    {
+                        if (Math.Abs(top - otherTop) < GUIDE_SNAP_DISTANCE || 
+                            Math.Abs(bottom - otherBounds.Bottom) < GUIDE_SNAP_DISTANCE ||
+                            Math.Abs(centerY - otherCenterY) < GUIDE_SNAP_DISTANCE)
+                        {
+                            // 水平辅助线 - 画一条贯穿画布的水平线
+                            _horizontalGuideLine = new Line
+                            {
+                                X1 = 0,
+                                X2 = shapeCanvas.ActualWidth,
+                                Y1 = otherTop,
+                            Y2 = otherTop,
+                            Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
+                            StrokeThickness = 1,
+                            StrokeDashArray = new DoubleCollection { 4, 2 },
+                            Tag = "guide-line",
+                            IsHitTestVisible = false
+                        };
+                        shapeCanvas.Children.Add(_horizontalGuideLine);
+                        hasHorizontalGuide = true;
+                    }
+                }
+                
+                // 垂直对齐检测（左侧、右侧、居中）
+                if (!hasVerticalGuide)
+                {
+                    if (Math.Abs(left - otherLeft) < GUIDE_SNAP_DISTANCE ||
+                        Math.Abs(right - otherBounds.Right) < GUIDE_SNAP_DISTANCE ||
+                        Math.Abs(centerX - otherCenterX) < GUIDE_SNAP_DISTANCE)
+                    {
+                        // 垂直辅助线 - 画一条贯穿画布的垂直线
+                        _verticalGuideLine = new Line
+                        {
+                            X1 = otherLeft,
+                            X2 = otherLeft,
+                            Y1 = 0,
+                            Y2 = shapeCanvas.ActualHeight,
+                            Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
+                            StrokeThickness = 1,
+                            StrokeDashArray = new DoubleCollection { 4, 2 },
+                            Tag = "guide-line",
+                            IsHitTestVisible = false
+                        };
+                        shapeCanvas.Children.Add(_verticalGuideLine);
+                        hasVerticalGuide = true;
+                    }
+                }
+                
+                if (hasHorizontalGuide && hasVerticalGuide) break;
+            }
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"辅助线异常: {ex.Message}");
+                ClearGuideLines();
+            }
+        }
+        
+        // 显示水平辅助线
+        private void ShowHorizontalGuide(double y, string label)
+        {
+            _horizontalGuideLine = new Line
+            {
+                X1 = 0,
+                X2 = shapeCanvas.ActualWidth,
+                Y1 = y,
+                Y2 = y,
+                Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 4, 2 },
+                Tag = "guide-line",
+                IsHitTestVisible = false
+            };
+            shapeCanvas.Children.Add(_horizontalGuideLine);
+            System.Diagnostics.Debug.WriteLine($"[辅助线] {label}");
+        }
+        
+        // 显示垂直辅助线
+        private void ShowVerticalGuide(double x, string label)
+        {
+            _verticalGuideLine = new Line
+            {
+                X1 = x,
+                X2 = x,
+                Y1 = 0,
+                Y2 = shapeCanvas.ActualHeight,
+                Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
+                StrokeThickness = 1,
+                StrokeDashArray = new DoubleCollection { 4, 2 },
+                Tag = "guide-line",
+                IsHitTestVisible = false
+            };
+            shapeCanvas.Children.Add(_verticalGuideLine);
+            System.Diagnostics.Debug.WriteLine($"[辅助线] {label}");
+        }
+        
+        // 清除辅助线
+        private void ClearGuideLines()
+        {
+            if (_horizontalGuideLine != null)
+            {
+                shapeCanvas.Children.Remove(_horizontalGuideLine);
+                _horizontalGuideLine = null;
+            }
+            if (_verticalGuideLine != null)
+            {
+                shapeCanvas.Children.Remove(_verticalGuideLine);
+                _verticalGuideLine = null;
             }
         }
         
@@ -2588,7 +2821,16 @@ namespace ElectronicWhiteboard
                     
                     Canvas.SetLeft(shape, newLeft);
                     Canvas.SetTop(shape, newTop);
+                    
+                    // 更新 ShapeModel 坐标
+                    UpdateShapeModelPosition(shape, newLeft, newTop);
                 }
+            }
+            
+            // 显示辅助线（使用第一个选中的图形作为参考）
+            if (_selectedShapes.Count > 0)
+            {
+                UpdateGuideLines(_selectedShapes[0], currentPos);
             }
         }
         
