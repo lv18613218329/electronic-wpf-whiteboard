@@ -138,6 +138,7 @@ namespace ElectronicWhiteboard
         private Ellipse? _highlightConnector; // 高亮显示的可连接点
         private bool _isDraggingToConnect = false; // 是否正在拖动创建连接
         private UIElement? _connectionSourceShape; // 连接源图形
+        private int _connectionSourceConnectorIndex = 0; // 源连接点索引
         private Line? _previewConnectionLine; // 连接线预览
         
         #endregion
@@ -2413,8 +2414,9 @@ namespace ElectronicWhiteboard
             if (bounds == Rect.Empty) return;
             
             // 创建并显示每个连接点
-            foreach (var connector in shapeModel.Connectors)
+            for (int connectorIndex = 0; connectorIndex < shapeModel.Connectors.Count; connectorIndex++)
             {
+                var connector = shapeModel.Connectors[connectorIndex];
                 if (!connector.IsEnabled) continue;
                 
                 var pos = connector.GetAbsolutePosition(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
@@ -2426,7 +2428,7 @@ namespace ElectronicWhiteboard
                     Fill = new SolidColorBrush(Color.FromRgb(255, 193, 7)), // 琥珀色
                     Stroke = Brushes.White,
                     StrokeThickness = 2,
-                    Tag = $"connector:{connector.Name}",
+                    Tag = $"connector:{connectorIndex}:{connector.Name}",
                     IsHitTestVisible = true,
                     Cursor = Cursors.Cross
                 };
@@ -2493,6 +2495,21 @@ namespace ElectronicWhiteboard
                 _isDraggingToConnect = true;
                 _connectionSourceShape = _selectedShape;
                 
+                // 从 Tag 中解析连接点索引
+                var tag = connector.Tag?.ToString() ?? "";
+                if (tag.StartsWith("connector:"))
+                {
+                    var parts = tag.Split(':');
+                    if (parts.Length >= 2 && int.TryParse(parts[1], out int idx))
+                    {
+                        _connectionSourceConnectorIndex = idx;
+                    }
+                    else
+                    {
+                        _connectionSourceConnectorIndex = 0;
+                    }
+                }
+                
                 var pos = e.GetPosition(shapeCanvas);
                 
                 // 创建预览连接线
@@ -2518,7 +2535,7 @@ namespace ElectronicWhiteboard
                 shapeCanvas.MouseMove += OnConnectorDragMove;
                 shapeCanvas.MouseLeftButtonUp += OnConnectorDragEnd;
                 
-                System.Diagnostics.Debug.WriteLine("[连接点] 开始创建连接");
+                System.Diagnostics.Debug.WriteLine($"[连接点] 开始创建连接，源连接点索引: {_connectionSourceConnectorIndex}");
             }
         }
         
@@ -2561,8 +2578,9 @@ namespace ElectronicWhiteboard
                 if (bounds == Rect.Empty) continue;
                 
                 // 检查每个连接点
-                foreach (var connector in model.Connectors)
+                for (int i = 0; i < model.Connectors.Count; i++)
                 {
+                    var connector = model.Connectors[i];
                     if (!connector.IsEnabled) continue;
                     
                     var connectorPos = connector.GetAbsolutePosition(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
@@ -2587,10 +2605,10 @@ namespace ElectronicWhiteboard
                         
                         shapeCanvas.Children.Add(_highlightConnector);
                         
-                        // 保存目标图形信息到 Tag
-                        _highlightConnector.Tag = $"connector-target:{child.GetHashCode()}";
+                        // 保存目标图形HashCode和连接点索引到 Tag
+                        _highlightConnector.Tag = $"connector-target:{child.GetHashCode()}:{i}";
                         
-                        System.Diagnostics.Debug.WriteLine($"[连接点] 检测到接近: {connector.Name}");
+                        System.Diagnostics.Debug.WriteLine($"[连接点] 检测到接近: {connector.Name}, 索引: {i}");
                         return;
                     }
                 }
@@ -2607,6 +2625,7 @@ namespace ElectronicWhiteboard
             if (_isDraggingToConnect)
             {
                 var pos = e.GetPosition(shapeCanvas);
+                int targetConnectorIndex = 0; // 默认使用第一个连接点
                 
                 // 检查是否创建了连接
                 if (_highlightConnector != null)
@@ -2614,9 +2633,13 @@ namespace ElectronicWhiteboard
                     var targetTag = _highlightConnector.Tag?.ToString() ?? "";
                     if (targetTag.StartsWith("connector-target:"))
                     {
-                        // 查找目标图形（通过 HashCode）
-                        if (int.TryParse(targetTag.Split(':')[1], out int targetHash))
+                        var parts = targetTag.Split(':');
+                        // 解析目标图形HashCode和连接点索引
+                        if (int.TryParse(parts[1], out int targetHash) && 
+                            parts.Length > 2 && int.TryParse(parts[2], out int connectorIdx))
                         {
+                            targetConnectorIndex = connectorIdx;
+                            
                             UIElement? targetShape = null;
                             foreach (UIElement child in shapeCanvas.Children)
                             {
@@ -2629,8 +2652,8 @@ namespace ElectronicWhiteboard
                             
                             if (targetShape != null && _connectionSourceShape != null)
                             {
-                                // 创建连接
-                                CreateConnection(_connectionSourceShape, targetShape);
+                                // 创建连接，传入目标连接点索引
+                                CreateConnection(_connectionSourceShape, targetShape, targetConnectorIndex);
                             }
                         }
                     }
@@ -2658,7 +2681,7 @@ namespace ElectronicWhiteboard
         }
         
         // 创建连接关系
-        private void CreateConnection(UIElement source, UIElement target)
+        private void CreateConnection(UIElement source, UIElement target, int targetConnectorIndex = 0)
         {
             // 获取源和目标的 ShapeModel
             var sourceModel = GetShapeModel(source);
@@ -2666,13 +2689,21 @@ namespace ElectronicWhiteboard
             
             if (sourceModel == null || targetModel == null) return;
             
+            // 确保连接点索引有效
+            if (targetConnectorIndex >= targetModel.Connectors.Count)
+                targetConnectorIndex = 0;
+            
+            int sourceConnectorIndex = _connectionSourceConnectorIndex;
+            if (sourceConnectorIndex >= sourceModel.Connectors.Count)
+                sourceConnectorIndex = 0;
+            
             // 创建连接模型
             var connection = new Models.ConnectionModel
             {
                 SourceShapeId = sourceModel.Id,
                 TargetShapeId = targetModel.Id,
-                SourceConnectorIndex = 0, // 使用默认连接点
-                TargetConnectorIndex = 0,
+                SourceConnectorIndex = sourceConnectorIndex, // 使用实际点击的源连接点
+                TargetConnectorIndex = targetConnectorIndex, // 使用实际吸附的目标连接点
                 StrokeColor = Colors.Gray,
                 StrokeThickness = 2
             };
@@ -2683,8 +2714,8 @@ namespace ElectronicWhiteboard
             var sourceBounds = GetElementBounds(source);
             var targetBounds = GetElementBounds(target);
             
-            var sourcePos = GetConnectorPosition(source, sourceModel, 0);
-            var targetPos = GetConnectorPosition(target, targetModel, 0);
+            var sourcePos = GetConnectorPosition(source, sourceModel, connection.SourceConnectorIndex);
+            var targetPos = GetConnectorPosition(target, targetModel, connection.TargetConnectorIndex);
             
             var connectionLine = new Line
             {
