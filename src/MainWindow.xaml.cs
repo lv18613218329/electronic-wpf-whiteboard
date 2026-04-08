@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Ink;
 using System.Windows.Input;
 using System.Windows.Media;
@@ -112,6 +113,10 @@ namespace ElectronicWhiteboard
         private readonly List<UIElement> _selectedShapes = new(); // 选中的多个图形
         private bool _isDraggingSelection = false; // 是否在拖动已选中的图形组
         
+        // Adorner相关字段
+        private AdornerLayer? _adornerLayer; // Adorner层
+        private ShapeAdorner? _currentAdorner; // 当前显示的Adorner
+        
         // 辅助线相关字段
         private Line? _horizontalGuideLine; // 水平对齐辅助线
         private Line? _verticalGuideLine; // 垂直对齐辅助线
@@ -160,6 +165,9 @@ namespace ElectronicWhiteboard
             // 初始化
             InitializeInkCanvas();
             InitializeEventHandlers();
+            
+            // 初始化Adorner层
+            _adornerLayer = AdornerLayer.GetAdornerLayer(shapeCanvas);
             
             // 设置默认工具
             SetTool(ToolType.Pen);
@@ -1534,8 +1542,7 @@ namespace ElectronicWhiteboard
                     {
                         Stroke = new SolidColorBrush(_currentColor),
                         StrokeThickness = _currentPenSize,
-                        Fill = Brushes.Transparent,
-                        Tag = _currentShapeTool
+                        Fill = Brushes.Transparent
                     };
                     
                     // 圆形：锁定宽度=高度
@@ -1560,6 +1567,22 @@ namespace ElectronicWhiteboard
                         ellipse.Width = width;
                         ellipse.Height = height;
                     }
+                    
+                    // 创建ShapeModel
+                    var shapeModel = new Models.ShapeModel
+                    {
+                        Type = Models.ShapeType.Ellipse,
+                        X = x,
+                        Y = y,
+                        Width = ellipse.Width,
+                        Height = ellipse.Height,
+                        FillColor = Colors.Transparent,
+                        StrokeColor = _currentColor,
+                        StrokeThickness = _currentPenSize
+                    };
+                    
+                    // 将ShapeModel关联到椭圆
+                    ellipse.Tag = shapeModel;
                     
                     Canvas.SetLeft(ellipse, x);
                     Canvas.SetTop(ellipse, y);
@@ -1606,9 +1629,24 @@ namespace ElectronicWhiteboard
                         StrokeThickness = _currentPenSize,
                         Fill = Brushes.Transparent,
                         Width = width,
-                        Height = height,
-                        Tag = _currentShapeTool
+                        Height = height
                     };
+                    
+                    // 创建ShapeModel
+                    var shapeModel = new Models.ShapeModel
+                    {
+                        Type = Models.ShapeType.Rectangle,
+                        X = x,
+                        Y = y,
+                        Width = rectangle.Width,
+                        Height = rectangle.Height,
+                        FillColor = Colors.Transparent,
+                        StrokeColor = _currentColor,
+                        StrokeThickness = _currentPenSize
+                    };
+                    
+                    // 将ShapeModel关联到矩形
+                    rectangle.Tag = shapeModel;
                     
                     // 圆角矩形
                     if (_currentShapeTool == "RoundedRect")
@@ -1633,10 +1671,24 @@ namespace ElectronicWhiteboard
                         {
                             x = _rectStartPoint.X - (size - width) / 2;
                         }
+                        
+                        // 更新ShapeModel
+                        if (rectangle.Tag is Models.ShapeModel model)
+                        {
+                            model.Width = size;
+                            model.Height = size;
+                        }
                     }
                     
                     Canvas.SetLeft(rectangle, x);
                     Canvas.SetTop(rectangle, y);
+                    
+                    // 更新ShapeModel的位置
+                    if (rectangle.Tag is Models.ShapeModel model2)
+                    {
+                        model2.X = x;
+                        model2.Y = y;
+                    }
                     
                     shapeCanvas.Children.Add(rectangle);
                     _shapes.Add(rectangle); // 添加到 shapes 列表用于撤销
@@ -2256,6 +2308,21 @@ namespace ElectronicWhiteboard
                 p.Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217));
                 p.StrokeThickness = p.StrokeThickness + 2;
             }
+            
+            // 添加Adorner（如果是单个选中）
+            if (_selectedShapes.Count == 1 && _adornerLayer != null)
+            {
+                // 移除之前的Adorner
+                if (_currentAdorner != null)
+                {
+                    _adornerLayer.Remove(_currentAdorner);
+                }
+                
+                // 创建新的Adorner并添加旋转事件
+                _currentAdorner = new ShapeAdorner(shape);
+                _currentAdorner.RotationChanged += OnShapeRotationChanged;
+                _adornerLayer.Add(_currentAdorner);
+            }
         }
         
         // 取消选择图形
@@ -2277,6 +2344,14 @@ namespace ElectronicWhiteboard
                     p.Stroke = new SolidColorBrush(_currentColor);
                     p.StrokeThickness = _currentPenSize;
                 }
+                
+                // 移除Adorner
+                if (_currentAdorner != null && _adornerLayer != null)
+                {
+                    _adornerLayer.Remove(_currentAdorner);
+                    _currentAdorner = null;
+                }
+                
                 _selectedShape = null;
             }
         }
@@ -2314,6 +2389,17 @@ namespace ElectronicWhiteboard
                 model.X = x;
                 model.Y = y;
                 System.Diagnostics.Debug.WriteLine($"[ShapeModel] 更新坐标: X={x:F0}, Y={y:F0}");
+            }
+        }
+        
+        // 处理图形旋转变化
+        private void OnShapeRotationChanged(UIElement shape, double angle)
+        {
+            // 更新 ShapeModel 的旋转角度
+            if (shape is FrameworkElement fe && fe.Tag is Models.ShapeModel model)
+            {
+                model.RotationAngle = angle;
+                System.Diagnostics.Debug.WriteLine($"[ShapeModel] 更新旋转角度: {angle:F2}°");
             }
         }
         
@@ -2423,9 +2509,9 @@ namespace ElectronicWhiteboard
                                 X2 = shapeCanvas.ActualWidth,
                                 Y1 = otherTop,
                             Y2 = otherTop,
-                            Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
-                            StrokeThickness = 1,
-                            StrokeDashArray = new DoubleCollection { 4, 2 },
+                            Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色
+                            StrokeThickness = 2,
+                            StrokeDashArray = new DoubleCollection { 5, 3 },
                             Tag = "guide-line",
                             IsHitTestVisible = false
                         };
@@ -2448,9 +2534,9 @@ namespace ElectronicWhiteboard
                             X2 = otherLeft,
                             Y1 = 0,
                             Y2 = shapeCanvas.ActualHeight,
-                            Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
-                            StrokeThickness = 1,
-                            StrokeDashArray = new DoubleCollection { 4, 2 },
+                            Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色
+                            StrokeThickness = 2,
+                            StrokeDashArray = new DoubleCollection { 5, 3 },
                             Tag = "guide-line",
                             IsHitTestVisible = false
                         };
@@ -2478,9 +2564,9 @@ namespace ElectronicWhiteboard
                 X2 = shapeCanvas.ActualWidth,
                 Y1 = y,
                 Y2 = y,
-                Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
-                StrokeThickness = 1,
-                StrokeDashArray = new DoubleCollection { 4, 2 },
+                Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色，更明显
+                StrokeThickness = 2,
+                StrokeDashArray = new DoubleCollection { 5, 3 },
                 Tag = "guide-line",
                 IsHitTestVisible = false
             };
@@ -2497,9 +2583,9 @@ namespace ElectronicWhiteboard
                 X2 = x,
                 Y1 = 0,
                 Y2 = shapeCanvas.ActualHeight,
-                Stroke = new SolidColorBrush(Color.FromRgb(74, 144, 217)),
-                StrokeThickness = 1,
-                StrokeDashArray = new DoubleCollection { 4, 2 },
+                Stroke = new SolidColorBrush(Color.FromRgb(255, 87, 34)), // 亮橙色，更明显
+                StrokeThickness = 2,
+                StrokeDashArray = new DoubleCollection { 5, 3 },
                 Tag = "guide-line",
                 IsHitTestVisible = false
             };
@@ -2758,6 +2844,13 @@ namespace ElectronicWhiteboard
             }
             _selectedShapes.Clear();
             _selectedShape = null;
+            
+            // 移除Adorner
+            if (_currentAdorner != null && _adornerLayer != null)
+            {
+                _adornerLayer.Remove(_currentAdorner);
+                _currentAdorner = null;
+            }
         }
         
         // 切换图形选中状态（Ctrl+点击时使用）
